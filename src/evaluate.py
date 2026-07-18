@@ -3,6 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 import shap
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, roc_auc_score,
@@ -45,64 +47,72 @@ def evaluate_model(X_test, y_test, pipeline, feature_names):
     return metrics, cm, report
 
 
+def _get_explainer(classifier, background_data):
+    if hasattr(classifier, "feature_importances_"):
+        return shap.TreeExplainer(classifier)
+    else:
+        return shap.LinearExplainer(classifier, background_data)
+
+
+def _get_shap_values(explainer, data):
+    try:
+        sv = explainer.shap_values(data)
+        if isinstance(sv, list):
+            sv = sv[0]
+        return sv
+    except Exception as e:
+        print(f"SHAP values computation failed: {e}")
+        return None
+
+
 def generate_shap_explanations(pipeline, X_test, feature_names, output_dir="models"):
     os.makedirs(output_dir, exist_ok=True)
 
     classifier = pipeline.named_steps["classifier"]
     X_test_processed = pipeline.named_steps["preprocessor"].transform(X_test)
 
-    if hasattr(classifier, "feature_importances_"):
-        explainer = shap.TreeExplainer(classifier)
-        shap_values = explainer.shap_values(X_test_processed)
-    else:
-        explainer = shap.LinearExplainer(classifier, X_test_processed)
-        shap_values = explainer.shap_values(X_test_processed)
+    explainer = _get_explainer(classifier, X_test_processed[:100])
+    shap_values = _get_shap_values(explainer, X_test_processed)
 
-    _check_shape_consistency(shap_values, X_test_processed, feature_names)
+    if shap_values is None:
+        print("Skipping SHAP plots (SHAP computation failed)")
+        return
 
     plt.figure(figsize=(14, max(6, len(feature_names) * 0.35)))
-    shap.summary_plot(
-        shap_values, X_test_processed, feature_names=feature_names,
-        show=False, max_display=min(20, len(feature_names)),
-        plot_size=None, color_bar=True
-    )
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "shap_summary.png"), dpi=150, bbox_inches="tight")
-    plt.close()
+    try:
+        shap.summary_plot(
+            shap_values, X_test_processed, feature_names=feature_names,
+            show=False, max_display=min(20, len(feature_names)),
+            plot_size=None, color_bar=True
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "shap_summary.png"), dpi=150, bbox_inches="tight")
+    except Exception as e:
+        print(f"Summary plot failed: {e}")
+    finally:
+        plt.close()
 
-    _generate_force_plot(explainer, shap_values, X_test_processed, feature_names, output_dir, 0,
-                         "shap_local_low_risk")
-    _generate_force_plot(explainer, shap_values, X_test_processed, feature_names, output_dir, 1,
-                         "shap_local_borderline")
-    _generate_force_plot(explainer, shap_values, X_test_processed, feature_names, output_dir, -1,
-                         "shap_local_high_risk")
+    indices = [(0, "shap_local_low_risk"), (1, "shap_local_borderline"), (-1, "shap_local_high_risk")]
+    for idx, filename in indices:
+        _generate_force_plot_safe(
+            explainer, shap_values, X_test_processed,
+            feature_names, output_dir, idx, filename
+        )
 
     print(f"SHAP plots saved to {output_dir}")
 
 
-def _check_shape_consistency(shap_values, X_processed, feature_names):
-    if isinstance(shap_values, list):
-        shap_values = shap_values[0]
-    if shap_values.ndim == 1:
-        shap_values = shap_values.reshape(1, -1)
-    n_features = X_processed.shape[1]
-    if shap_values.shape[1] != n_features:
-        print(f"Warning: SHAP values shape {shap_values.shape} doesn't match X shape {X_processed.shape}")
-        return
-    if len(feature_names) != n_features:
-        print(f"Warning: {len(feature_names)} feature names but {n_features} features in data")
-
-
-def _generate_force_plot(explainer, shap_values, X_processed, feature_names, output_dir, idx, filename):
-    if isinstance(shap_values, list):
-        shap_vals = shap_values[0]
-    else:
-        shap_vals = shap_values
-
+def _generate_force_plot_safe(explainer, shap_values, X_processed, feature_names, output_dir, idx, filename):
     if X_processed.shape[0] <= abs(idx):
         return
 
+    if isinstance(shap_values, list):
+        sv = shap_values[0]
+    else:
+        sv = shap_values
+
     sample = X_processed[idx:idx+1] if idx >= 0 else X_processed[idx:]
+    shap_val = sv[idx] if idx >= 0 else sv[idx]
 
     if hasattr(explainer, "expected_value"):
         ev = explainer.expected_value
@@ -111,20 +121,33 @@ def _generate_force_plot(explainer, shap_values, X_processed, feature_names, out
     else:
         ev = 0
 
-    shap_val = shap_vals[idx] if idx >= 0 else shap_vals[idx]
-    if shap_val.ndim == 0:
-        shap_val = shap_val.reshape(1, -1)
+    try:
+        shap.force_plot(
+            ev, shap_val, sample,
+            feature_names=feature_names,
+            matplotlib=True, show=False,
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"{filename}.png"), dpi=150, bbox_inches="tight")
+    except Exception as e:
+        print(f"Force plot {filename} failed: {e}")
+        _generate_horizontal_bar_plot(shap_val, feature_names, output_dir, filename)
+    finally:
+        plt.close()
 
-    plt.figure(figsize=(16, 3))
-    shap.force_plot(
-        ev,
-        shap_val,
-        sample,
-        feature_names=feature_names,
-        matplotlib=True,
-        show=False,
-        text_rotation=30,
-    )
+
+def _generate_horizontal_bar_plot(shap_values, feature_names, output_dir, filename):
+    vals = np.array(shap_values).flatten()
+    names = feature_names[:len(vals)]
+    top_k = min(10, len(vals))
+    top_idx = np.argsort(np.abs(vals))[::-1][:top_k]
+
+    plt.figure(figsize=(10, max(4, top_k * 0.4)))
+    colors = ["#ef4444" if vals[i] > 0 else "#22c55e" for i in top_idx]
+    plt.barh(range(top_k), vals[top_idx], color=colors)
+    plt.yticks(range(top_k), [names[i] for i in top_idx])
+    plt.axvline(0, color="white", linewidth=0.5)
+    plt.xlabel("SHAP value")
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{filename}.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -135,7 +158,6 @@ def business_interpretation(metrics):
     target_recall = min(current_recall + 0.1, 0.99)
     precision = metrics["precision"]
     current_f1 = metrics["f1"]
-
     additional_churners = int(7043 * (target_recall - current_recall))
 
     print(f"""
@@ -162,12 +184,17 @@ Business trade-off:
 
 
 if __name__ == "__main__":
-    from src.preprocessing import load_data, prepare_data
+    from src.preprocessing import load_data
     from src.features import engineer_features
+    from sklearn.model_selection import train_test_split
 
     df = load_data("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
     df = engineer_features(df)
-    X_train, X_test, y_train, y_test, preprocessor, num, low, high = prepare_data(df)
+    X = df.drop(columns=["Churn", "customerID"], errors="ignore")
+    y = df["Churn"]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
     pipeline, feature_names = load_model_and_features()
     metrics, cm, report = evaluate_model(X_test, y_test, pipeline, feature_names)

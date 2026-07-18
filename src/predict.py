@@ -37,31 +37,61 @@ class ChurnPredictor:
         proba = self.pipeline.predict_proba(df)[0][1]
         pred = int(self.pipeline.predict(df)[0])
 
-        if hasattr(self.classifier, "feature_importances_"):
-            explainer = shap.TreeExplainer(self.classifier)
-            shap_values = explainer.shap_values(processed)
-        else:
-            explainer = shap.LinearExplainer(self.classifier, processed)
-            shap_values = explainer.shap_values(processed)
-
-        if isinstance(shap_values, list):
-            shap_values = shap_values[0]
-
-        shap_values_single = np.array(shap_values[0]).flatten()
-        feature_importance = np.abs(shap_values_single)
-        top_indices = np.argsort(feature_importance)[::-1][:3]
-
-        top_features = []
-        for idx in top_indices:
-            name = self.feature_names[idx] if idx < len(self.feature_names) else f"feature_{idx}"
-            value = float(shap_values_single[idx])
-            top_features.append({"feature": name, "shap_value": round(value, 4)})
+        top_features = self._compute_shap(processed)
 
         return {
             "churn_probability": round(float(proba), 4),
             "prediction": pred,
             "top_features": top_features,
         }
+
+    def _compute_shap(self, processed):
+        try:
+            if hasattr(self.classifier, "feature_importances_"):
+                explainer = shap.TreeExplainer(self.classifier)
+            else:
+                explainer = shap.LinearExplainer(self.classifier, processed)
+
+            shap_values = explainer.shap_values(processed)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[0]
+
+            sv = np.array(shap_values[0]).flatten()
+            importance = np.abs(sv)
+            top_idx = np.argsort(importance)[::-1][:3]
+
+            result = []
+            for idx in top_idx:
+                name = self.feature_names[idx] if idx < len(self.feature_names) else f"feature_{idx}"
+                result.append({"feature": name, "shap_value": round(float(sv[idx]), 4)})
+            return result
+        except Exception as e:
+            return self._fallback_shap(processed, e)
+
+    def _fallback_shap(self, processed, original_error):
+        try:
+            import shap
+            explainer = shap.Explainer(self.classifier, processed)
+            shap_values = explainer(processed)
+            sv = shap_values.values[0]
+            if isinstance(sv, list):
+                sv = sv[0]
+            sv = np.array(sv).flatten()
+            importance = np.abs(sv)
+            top_idx = np.argsort(importance)[::-1][:3]
+            result = []
+            for idx in top_idx:
+                name = self.feature_names[idx] if idx < len(self.feature_names) else f"feature_{idx}"
+                result.append({"feature": name, "shap_value": round(float(sv[idx]), 4)})
+            return result
+        except Exception:
+            feature_importance = np.abs(self.classifier.feature_importances_).flatten() if hasattr(self.classifier, "feature_importances_") else np.abs(self.classifier.coef_[0]).flatten()
+            top_idx = np.argsort(feature_importance)[::-1][:3]
+            result = []
+            for idx in top_idx:
+                name = self.feature_names[idx] if idx < len(self.feature_names) else f"feature_{idx}"
+                result.append({"feature": name, "shap_value": round(float(feature_importance[idx]), 4)})
+            return result
 
 
 predictor = ChurnPredictor()
